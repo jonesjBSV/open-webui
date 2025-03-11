@@ -1542,6 +1542,13 @@ PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH = int(
     os.environ.get("PGVECTOR_INITIALIZE_MAX_VECTOR_LENGTH", "1536")
 )
 
+# Weaviate
+WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://localhost:8080")
+WEAVIATE_API_KEY = os.environ.get("WEAVIATE_API_KEY", "")
+WEAVIATE_GRPC_URL = os.environ.get("WEAVIATE_GRPC_URL", "")
+WEAVIATE_BATCH_SIZE = int(os.environ.get("WEAVIATE_BATCH_SIZE", "100"))
+WEAVIATE_TENANT = os.environ.get("WEAVIATE_TENANT", "")
+
 ####################################
 # Information Retrieval (RAG)
 ####################################

@@ -1,34 +1,60 @@
 services:
-  ollama:
-    volumes:
-      - ollama:/root/.ollama
-    container_name: ollama
-    pull_policy: always
-    tty: true
-    restart: unless-stopped
-    image: ollama/ollama:${OLLAMA_DOCKER_TAG-latest}
-
   open-webui:
+    # For development, we'll build the project from the Dockerfile instead of using a pre-built image
     build:
       context: .
-      args:
-        OLLAMA_BASE_URL: '/ollama'
       dockerfile: Dockerfile
-    image: ghcr.io/open-webui/open-webui:${WEBUI_DOCKER_TAG-main}
+      args:
+        # Set any build args you need
+        OLLAMA_BASE_URL: '/ollama'
     container_name: open-webui
     volumes:
+      # Persistent data volume
       - open-webui:/app/backend/data
-    depends_on:
-      - ollama
+      # Mount source code directories for live code changes
+      - ./src:/app/src:ro
+      - ./backend:/app/backend
+      - ./static:/app/static:ro
+      # Mount configuration files
+      - ./svelte.config.js:/app/svelte.config.js:ro
+      - ./tailwind.config.js:/app/tailwind.config.js:ro
+      - ./vite.config.ts:/app/vite.config.ts:ro
+      - ./package.json:/app/package.json:ro
     ports:
       - ${OPEN_WEBUI_PORT-3000}:8080
     environment:
-      - 'OLLAMA_BASE_URL=http://ollama:11434'
+      - 'OLLAMA_BASE_URL=http://host.docker.internal:11434'
       - 'WEBUI_SECRET_KEY='
+      # Development environment
+      - 'ENV=dev'
+      # Set Weaviate as the vector database
+      - 'VECTOR_DB=weaviate'
+      - 'WEAVIATE_URL=http://weaviate:8080'
+      # Hot reload for frontend (if supported)
+      - 'VITE_SVELTEKIT_ADAPTER_NODE_RELOAD=1'
     extra_hosts:
       - host.docker.internal:host-gateway
+    depends_on:
+      - weaviate
+    restart: unless-stopped
+
+  weaviate:
+    image: semitechnologies/weaviate:1.24.1
+    container_name: weaviate
+    ports:
+      - "8081:8080"
+      - "50051:50051"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'none'
+      CLUSTER_HOSTNAME: 'node1'
+      ENABLE_MODULES: ''
     restart: unless-stopped
 
 volumes:
-  ollama: {}
   open-webui: {}
+  weaviate_data: {}

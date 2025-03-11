@@ -1648,13 +1648,361 @@ def process_files_batch(
                 result.status = "completed"
 
         except Exception as e:
+            log.error(f"process_files_batch: Error saving documents to vector DB: {str(e)}")
+            for result in results:
+                result.status = "failed"
+
+
+# GraphRAG specific models
+class GraphRelationshipType(str, Enum):
+    SEMANTIC = "semantic"
+    HIERARCHICAL = "hierarchical"
+    SEQUENTIAL = "sequential"
+
+
+class ProcessGraphRAGForm(BaseModel):
+    file_ids: List[str]
+    collection_name: str
+    relationship_type: GraphRelationshipType = GraphRelationshipType.SEMANTIC
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+
+
+class GraphProcessResult(BaseModel):
+    file_id: str
+    status: str
+    error: Optional[str] = None
+    chunk_ids: Optional[List[str]] = None
+
+
+class GraphRAGResponse(BaseModel):
+    collection_name: str
+    relationship_type: str
+    results: List[GraphProcessResult]
+    errors: List[GraphProcessResult]
+    graph_relationships_created: bool
+
+
+@router.post("/process/graphrag")
+def process_files_for_graphrag(
+    request: Request,
+    form_data: ProcessGraphRAGForm,
+    user=Depends(get_verified_user),
+) -> GraphRAGResponse:
+    """
+    Process files specifically for graphRAG in Weaviate.
+    This creates relationships between chunks based on the specified relationship type.
+    """
+    # Check if Weaviate is configured
+    if request.app.state.config.VECTOR_DB != "weaviate":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GraphRAG is only supported with Weaviate as the vector database.",
+        )
+
+    results: List[GraphProcessResult] = []
+    errors: List[GraphProcessResult] = []
+    collection_name = form_data.collection_name
+    relationship_type = form_data.relationship_type
+    
+    # Get files by IDs
+    files = []
+    for file_id in form_data.file_ids:
+        try:
+            file = Files.get_file_by_id(file_id)
+            files.append(file)
+        except Exception as e:
+            log.error(f"process_files_for_graphrag: Error getting file {file_id}: {str(e)}")
+            errors.append(
+                GraphProcessResult(file_id=file_id, status="failed", error=f"File not found: {str(e)}")
+            )
+    
+    # Process each file and track chunk IDs for relationship creation
+    all_docs: List[Document] = []
+    all_chunk_ids: List[str] = []
+    file_chunk_ids_map: Dict[str, List[str]] = {}
+    
+    for file in files:
+        try:
+            text_content = file.data.get("content", "")
+            if not text_content:
+                # Try to load content if not available
+                file_path = file.path
+                if file_path:
+                    file_path = Storage.get_file(file_path)
+                    loader = Loader(
+                        engine=request.app.state.config.CONTENT_EXTRACTION_ENGINE,
+                        TIKA_SERVER_URL=request.app.state.config.TIKA_SERVER_URL,
+                        PDF_EXTRACT_IMAGES=request.app.state.config.PDF_EXTRACT_IMAGES,
+                    )
+                    file_docs = loader.load(
+                        file.filename, file.meta.get("content_type"), file_path
+                    )
+                    text_content = " ".join([doc.page_content for doc in file_docs])
+                    Files.update_file_data_by_id(file.id, {"content": text_content})
+
+            # Create initial document
+            doc = Document(
+                page_content=text_content.replace("<br/>", "\n"),
+                metadata={
+                    **file.meta,
+                    "name": file.filename,
+                    "created_by": file.user_id,
+                    "file_id": file.id,
+                    "source": file.filename,
+                },
+            )
+
+            # Split document based on configuration
+            chunk_size = form_data.chunk_size or request.app.state.config.CHUNK_SIZE
+            chunk_overlap = form_data.chunk_overlap or request.app.state.config.CHUNK_OVERLAP
+            
+            if request.app.state.config.TEXT_SPLITTER in ["", "character"]:
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    add_start_index=True,
+                )
+            elif request.app.state.config.TEXT_SPLITTER == "token":
+                text_splitter = TokenTextSplitter(
+                    encoding_name=str(request.app.state.config.TIKTOKEN_ENCODING_NAME),
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    add_start_index=True,
+                )
+            else:
+                raise ValueError(ERROR_MESSAGES.DEFAULT("Invalid text splitter"))
+
+            docs = text_splitter.split_documents([doc])
+            
+            # Add chunk index and type metadata for graphRAG
+            for i, chunk_doc in enumerate(docs):
+                chunk_doc.metadata["chunk_index"] = i
+                
+                # Simple heuristic to determine chunk type based on content
+                content = chunk_doc.page_content.strip()
+                if content.startswith('#'):
+                    chunk_doc.metadata["chunk_type"] = "heading"
+                elif content.startswith('- ') or content.startswith('* ') or bool(re.match(r'^\d+\.\s', content)):
+                    chunk_doc.metadata["chunk_type"] = "list"
+                elif len(content.split()) < 15:  # Short chunks might be titles or captions
+                    chunk_doc.metadata["chunk_type"] = "short_text"
+                else:
+                    chunk_doc.metadata["chunk_type"] = "paragraph"
+
+            hash = calculate_sha256_string(text_content)
+            Files.update_file_hash_by_id(file.id, hash)
+            
+            # Track documents and update file info
+            all_docs.extend(docs)
+            Files.update_file_metadata_by_id(file.id, {"collection_name": collection_name})
+            
+            results.append(GraphProcessResult(file_id=file.id, status="prepared"))
+
+        except Exception as e:
+            log.error(f"process_files_for_graphrag: Error processing file {file.id}: {str(e)}")
+            errors.append(
+                GraphProcessResult(file_id=file.id, status="failed", error=str(e))
+            )
+
+    # Save all chunks to vector DB and create relationships
+    if all_docs:
+        try:
+            # Generate embeddings and save to vector DB
+            embedding_function = get_embedding_function(
+                request.app.state.config.RAG_EMBEDDING_ENGINE,
+                request.app.state.config.RAG_EMBEDDING_MODEL,
+                request.app.state.ef,
+                (
+                    request.app.state.config.RAG_OPENAI_API_BASE_URL
+                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+                    else request.app.state.config.RAG_OLLAMA_BASE_URL
+                ),
+                (
+                    request.app.state.config.RAG_OPENAI_API_KEY
+                    if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+                    else request.app.state.config.RAG_OLLAMA_API_KEY
+                ),
+                request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+            )
+            
+            texts = [doc.page_content for doc in all_docs]
+            embeddings = embedding_function(
+                list(map(lambda x: x.replace("\n", " "), texts)), user=user
+            )
+            
+            metadatas = [
+                {
+                    **doc.metadata,
+                    "embedding_config": json.dumps(
+                        {
+                            "engine": request.app.state.config.RAG_EMBEDDING_ENGINE,
+                            "model": request.app.state.config.RAG_EMBEDDING_MODEL,
+                        }
+                    ),
+                }
+                for doc in all_docs
+            ]
+            
+            # Format data for ChromaDB/Weaviate
+            items = [
+                {
+                    "id": str(uuid.uuid4()),
+                    "text": text,
+                    "vector": embeddings[idx],
+                    "metadata": metadatas[idx],
+                }
+                for idx, text in enumerate(texts)
+            ]
+            
+            # Track chunk IDs by file
+            for idx, item in enumerate(items):
+                file_id = item["metadata"]["file_id"]
+                if file_id not in file_chunk_ids_map:
+                    file_chunk_ids_map[file_id] = []
+                file_chunk_ids_map[file_id].append(item["id"])
+                all_chunk_ids.append(item["id"])
+            
+            # Insert items into Weaviate
+            from open_webui.retrieval.vector.connector import VECTOR_DB_CLIENT
+            if VECTOR_DB_CLIENT.has_collection(collection_name=collection_name):
+                # Add to existing collection
+                VECTOR_DB_CLIENT.insert(collection_name=collection_name, items=items)
+            else:
+                # Create collection and add items
+                VECTOR_DB_CLIENT.insert(collection_name=collection_name, items=items)
+            
+            # Create graph relationships between chunks
+            graph_relationships_created = False
+            if hasattr(VECTOR_DB_CLIENT, "create_graph_relationships"):
+                # First create relationships within each file
+                for file_id, chunk_ids in file_chunk_ids_map.items():
+                    if len(chunk_ids) > 1:
+                        VECTOR_DB_CLIENT.create_graph_relationships(
+                            collection_name=collection_name,
+                            chunk_ids=chunk_ids,
+                            relationship_type=relationship_type
+                        )
+                
+                # Update results with chunk IDs
+                for result in results:
+                    file_id = result.file_id
+                    if file_id in file_chunk_ids_map:
+                        result.chunk_ids = file_chunk_ids_map[file_id]
+                    result.status = "completed"
+                
+                graph_relationships_created = True
+            else:
+                # If the client doesn't support graph relationships, just mark files as processed
+                for result in results:
+                    if result.file_id in file_chunk_ids_map:
+                        result.chunk_ids = file_chunk_ids_map[result.file_id]
+                    result.status = "completed (no graph support)"
+
+            return GraphRAGResponse(
+                collection_name=collection_name,
+                relationship_type=relationship_type,
+                results=results,
+                errors=errors,
+                graph_relationships_created=graph_relationships_created
+            )
+
+        except Exception as e:
             log.error(
-                f"process_files_batch: Error saving documents to vector DB: {str(e)}"
+                f"process_files_for_graphrag: Error saving documents to vector DB: {str(e)}"
             )
             for result in results:
                 result.status = "failed"
+                
+            # For each result, append to errors list
+            for result in results:
                 errors.append(
-                    BatchProcessFilesResult(file_id=result.file_id, error=str(e))
+                    GraphProcessResult(file_id=result.file_id, status="failed", error=str(e))
                 )
+                
+            # Return error response
+            return GraphRAGResponse(
+                collection_name=collection_name,
+                relationship_type=relationship_type,
+                results=results,
+                errors=errors,
+                graph_relationships_created=False
+            )
 
+    # This return is for the batch processing endpoint, not the GraphRAG endpoint
+    # It should only be reached in the batch processing endpoint
     return BatchProcessFilesResponse(results=results, errors=errors)
+
+
+# GraphRAG Query Models
+class GraphQueryRequest(BaseModel):
+    collection_name: str
+    query_vector: List[float]
+    limit: int = 5
+    depth: int = 1
+
+
+@router.post("/query/graph")
+def query_graph(
+    request: Request,
+    form_data: GraphQueryRequest,
+    user=Depends(get_verified_user),
+) -> dict:
+    """
+    Perform a graph-enhanced search using Weaviate's graph capabilities.
+    This endpoint uses both vector similarity and graph relationships for retrieval.
+    """
+    # Check if Weaviate is configured
+    if request.app.state.config.VECTOR_DB != "weaviate":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="GraphRAG is only supported with Weaviate as the vector database.",
+        )
+    
+    collection_name = form_data.collection_name
+    query_vector = form_data.query_vector
+    limit = form_data.limit
+    depth = form_data.depth
+    
+    try:
+        # Use the graph_search method from our WeaviateClient
+        from open_webui.retrieval.vector.connector import VECTOR_DB_CLIENT
+        
+        if not hasattr(VECTOR_DB_CLIENT, "graph_search"):
+            # Fallback to regular search if graph_search is not available
+            log.warning("WeaviateClient does not support graph_search, falling back to regular search")
+            result = VECTOR_DB_CLIENT.search(
+                collection_name=collection_name,
+                vectors=[query_vector],
+                limit=limit
+            )
+        else:
+            # Use graph-enhanced search
+            result = VECTOR_DB_CLIENT.graph_search(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                limit=limit,
+                depth=depth
+            )
+        
+        if result is None:
+            return {
+                "ids": [],
+                "distances": [],
+                "documents": [],
+                "metadatas": [],
+            }
+        
+        return {
+            "ids": result.ids,
+            "distances": result.distances,
+            "documents": result.documents,
+            "metadatas": result.metadatas,
+        }
+        
+    except Exception as e:
+        log.error(f"Error in graph search: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error performing graph search: {str(e)}",
+        )

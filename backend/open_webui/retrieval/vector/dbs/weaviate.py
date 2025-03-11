@@ -490,3 +490,248 @@ class WeaviateClient:
         
         # Default empty filter
         return {}
+    
+    # GraphRAG specific methods
+    def create_graph_relationships(self, collection_name: str, chunk_ids: list[str], relationship_type: str = "semantic"):
+        """
+        Create graph relationships between chunks in a collection.
+        
+        Args:
+            collection_name: Name of the collection where chunks are stored
+            chunk_ids: List of chunk IDs to create relationships between
+            relationship_type: Type of relationship to create ("semantic", "hierarchical", or "sequential")
+        """
+        if not self.client or not self.has_collection(collection_name) or len(chunk_ids) < 2:
+            return False
+        
+        try:
+            # Configure batch size for the operation
+            self.batch.configure(batch_size=self.batch_size)
+            
+            # Process based on relationship type
+            if relationship_type == "semantic":
+                # Create bidirectional semantic relationships between all chunks
+                for i, source_id in enumerate(chunk_ids):
+                    related_ids = [id for j, id in enumerate(chunk_ids) if j != i]
+                    
+                    # Get current related chunks if any
+                    result = self.client.data_object.get(collection_name, source_id)
+                    current_related = result.get("related_chunks", []) if result else []
+                    
+                    # Combine existing and new relationships without duplicates
+                    all_related = list(set(current_related + related_ids))
+                    
+                    # Update the object with new relationships
+                    self.client.data_object.update(
+                        collection_name,
+                        source_id,
+                        {"related_chunks": all_related}
+                    )
+                    
+            elif relationship_type == "hierarchical":
+                # Create parent-child relationships (first chunk is parent, rest are children)
+                parent_id = chunk_ids[0]
+                child_ids = chunk_ids[1:]
+                
+                # Update parent with child IDs
+                self.client.data_object.update(
+                    collection_name,
+                    parent_id,
+                    {"child_chunks": child_ids}
+                )
+                
+                # Update each child with parent ID
+                for child_id in child_ids:
+                    self.client.data_object.update(
+                        collection_name,
+                        child_id,
+                        {"parent_chunk": parent_id}
+                    )
+                    
+            elif relationship_type == "sequential":
+                # Create next/prev relationships in sequence
+                for i in range(len(chunk_ids) - 1):
+                    current_id = chunk_ids[i]
+                    next_id = chunk_ids[i + 1]
+                    
+                    # Set next_chunk for current
+                    self.client.data_object.update(
+                        collection_name,
+                        current_id,
+                        {"next_chunk": next_id}
+                    )
+                    
+                    # Set prev_chunk for next
+                    self.client.data_object.update(
+                        collection_name,
+                        next_id,
+                        {"prev_chunk": current_id}
+                    )
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error creating graph relationships: {e}")
+            return False
+    
+    def graph_search(self, collection_name: str, query_vector: list[float], limit: int = 10, depth: int = 1):
+        """
+        Perform a graph-enhanced search that returns both nearest neighbors and their related chunks.
+        
+        Args:
+            collection_name: Name of the collection to search
+            query_vector: Query vector for semantic search
+            limit: Number of initial results to return
+            depth: How many levels of relationships to traverse
+        
+        Returns:
+            SearchResult object with combined results
+        """
+        if not self.client or not self.has_collection(collection_name):
+            return None
+        
+        try:
+            # Step 1: Get initial vector search results
+            query = (self.client.query
+                .get(collection_name, ["id", "text", "_additional {distance}"])
+                .with_near_vector({"vector": query_vector})
+                .with_limit(limit))
+            
+            result = query.do()
+            
+            if not result or "data" not in result or "Get" not in result["data"] or collection_name not in result["data"]["Get"]:
+                return None
+            
+            # Step 2: Extract initial chunk IDs
+            initial_items = result["data"]["Get"][collection_name]
+            initial_ids = [item["id"] for item in initial_items]
+            
+            # Step 3: Get related chunks based on graph relationships
+            all_ids = set(initial_ids)
+            current_ids = set(initial_ids)
+            
+            # Traverse the graph to the specified depth
+            for _ in range(depth):
+                next_ids = set()
+                
+                for chunk_id in current_ids:
+                    # Get all connected chunks (related, children, parent, next, prev)
+                    connected_query = (self.client.query
+                        .get(collection_name, ["id", "related_chunks", "child_chunks", "parent_chunk", "next_chunk", "prev_chunk"])
+                        .with_where({"path": ["id"], "operator": "Equal", "valueString": chunk_id}))
+                    
+                    connected_result = connected_query.do()
+                    
+                    if connected_result and "data" in connected_result and "Get" in connected_result["data"] and collection_name in connected_result["data"]["Get"]:
+                        chunk = connected_result["data"]["Get"][collection_name][0]
+                        
+                        # Add all related chunks
+                        if "related_chunks" in chunk and chunk["related_chunks"]:
+                            next_ids.update(chunk["related_chunks"])
+                        
+                        # Add all child chunks
+                        if "child_chunks" in chunk and chunk["child_chunks"]:
+                            next_ids.update(chunk["child_chunks"])
+                        
+                        # Add parent chunk
+                        if "parent_chunk" in chunk and chunk["parent_chunk"]:
+                            next_ids.add(chunk["parent_chunk"])
+                        
+                        # Add next and prev chunks
+                        if "next_chunk" in chunk and chunk["next_chunk"]:
+                            next_ids.add(chunk["next_chunk"])
+                        
+                        if "prev_chunk" in chunk and chunk["prev_chunk"]:
+                            next_ids.add(chunk["prev_chunk"])
+                
+                # Remove IDs we've already seen
+                next_ids = next_ids - all_ids
+                
+                # Update tracking sets
+                all_ids.update(next_ids)
+                current_ids = next_ids
+                
+                if not current_ids:
+                    break
+            
+            # Step 4: Retrieve all chunks in the graph neighborhood
+            all_ids_list = list(all_ids)
+            
+            # Build a complex query to get all chunks at once
+            if len(all_ids_list) > 0:
+                # Get the chunks data
+                chunks_query = (self.client.query
+                    .get(collection_name, ["id", "text", "_additional {distance}"])
+                    .with_where({
+                        "operator": "Or",
+                        "operands": [{
+                            "path": ["id"],
+                            "operator": "Equal",
+                            "valueString": chunk_id
+                        } for chunk_id in all_ids_list]
+                    }))
+                
+                chunks_result = chunks_query.do()
+                
+                if not chunks_result or "data" not in chunks_result or "Get" not in chunks_result["data"] or collection_name not in chunks_result["data"]["Get"]:
+                    return None
+                
+                # Step 5: Format results as expected by Open WebUI
+                items = chunks_result["data"]["Get"][collection_name]
+                
+                # Sort results to prioritize the initial vector search results
+                # This ensures the most semantically relevant results come first
+                sorted_items = sorted(items, key=lambda x: initial_ids.index(x["id"]) if x["id"] in initial_ids else float('inf'))
+                
+                ids = [[item["id"]] for item in sorted_items]
+                documents = [[item["text"]] for item in sorted_items]
+                
+                # For items from initial search, use actual distances
+                # For related items, use a default high distance
+                distances = []
+                for item in sorted_items:
+                    if item["id"] in initial_ids:
+                        # Find the original item to get its distance
+                        original = next(i for i in initial_items if i["id"] == item["id"])
+                        distances.append([original["_additional"]["distance"]])
+                    else:
+                        # Use a high distance for related items
+                        distances.append([0.9])
+                
+                # Get metadata for all items
+                metadatas = []
+                for item in sorted_items:
+                    # Query for metadata
+                    metadata_query = (self.client.query
+                        .get(collection_name, ["*"])
+                        .with_where({"path": ["id"], "operator": "Equal", "valueString": item["id"]}))
+                    
+                    metadata_result = metadata_query.do()
+                    
+                    if metadata_result and "data" in metadata_result and "Get" in metadata_result["data"] and collection_name in metadata_result["data"]["Get"]:
+                        meta_item = metadata_result["data"]["Get"][collection_name][0]
+                        # Remove None values
+                        metadata = {k: v for k, v in meta_item.items() if v is not None and k != "id" and k != "text"}
+                        
+                        # Add a flag to indicate if this is a direct search result or a related item
+                        metadata["is_direct_match"] = item["id"] in initial_ids
+                        
+                        metadatas.append([metadata])
+                    else:
+                        metadatas.append([{}])
+                
+                return SearchResult(
+                    **{
+                        "ids": ids,
+                        "distances": distances,
+                        "documents": documents,
+                        "metadatas": metadatas,
+                    }
+                )
+            
+            # If no related chunks, return just the initial results
+            return self.search(collection_name, [query_vector], limit)
+            
+        except Exception as e:
+            print(f"Error in graph search: {e}")
+            return None
